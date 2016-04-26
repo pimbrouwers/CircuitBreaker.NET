@@ -10,7 +10,9 @@ using System.Web.Caching;
 
 namespace CircuitBreaker
 {
-    private readonly object _circuitBreakerLock = new object();
+    public class CircuitBreaker
+    {
+        private readonly object _circuitBreakerLock = new object();
 
         private Cache _cache;
         private Cache Cache
@@ -38,7 +40,7 @@ namespace CircuitBreaker
         public string CacheKey { get; private set; }
         public CacheDependency CacheDependency { get; private set; }
         public TimeSpan CacheDuration { get; private set; }
-        
+
         public bool FileBacked { get; private set; }
         public string FileName { get; private set; }
         public string WorkingDirectory { get; private set; }
@@ -75,7 +77,7 @@ namespace CircuitBreaker
             if (FileBacked)
             {
                 FileName = GetFileNameFromCacheKey();
-            }                
+            }
 
             //Initialize
             MoveToClosedState();
