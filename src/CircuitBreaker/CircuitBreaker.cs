@@ -10,9 +10,7 @@ using System.Web.Caching;
 
 namespace CircuitBreaker
 {
-    public class CircuitBreaker
-    {
-        private readonly object _circuitBreakerLock = new object();
+    private readonly object _circuitBreakerLock = new object();
 
         private Cache _cache;
         private Cache Cache
@@ -40,7 +38,7 @@ namespace CircuitBreaker
         public string CacheKey { get; private set; }
         public CacheDependency CacheDependency { get; private set; }
         public TimeSpan CacheDuration { get; private set; }
-
+        
         public bool FileBacked { get; private set; }
         public string FileName { get; private set; }
         public string WorkingDirectory { get; private set; }
@@ -77,7 +75,7 @@ namespace CircuitBreaker
             if (FileBacked)
             {
                 FileName = GetFileNameFromCacheKey();
-            }
+            }                
 
             //Initialize
             MoveToClosedState();
@@ -89,7 +87,7 @@ namespace CircuitBreaker
         /// <typeparam name="T"></typeparam>
         /// <param name="funcToIvoke"></param>
         /// <returns>Object of type T of default(T)</returns>
-        public T Execute<T>(Func<T> funcToIvoke)
+        public T Execute<T>(Func<T> funcToInvoke)
         {
             T resp = default(T);
             this.lastExecutionException = null;
@@ -114,7 +112,7 @@ namespace CircuitBreaker
                     //lock here, to protect volatile resource
                     lock (_circuitBreakerLock)
                     {
-                        resp = funcToIvoke(); ;
+                        resp = funcToInvoke(); ;
                     }
                 }
                 else
@@ -141,7 +139,7 @@ namespace CircuitBreaker
                                     //lock here, to protect volatile resource
                                     lock (_circuitBreakerLock)
                                     {
-                                        resp = funcToIvoke();
+                                        resp = funcToInvoke();
 
                                         AddToCache(resp);
                                         WriteToFile(resp);
@@ -164,7 +162,7 @@ namespace CircuitBreaker
                                 //lock here, to protect volatile resource
                                 lock (_circuitBreakerLock)
                                 {
-                                    resp = funcToIvoke();
+                                    resp = funcToInvoke();
 
                                     AddToCache(resp);
                                     WriteToFile(resp);
@@ -195,7 +193,68 @@ namespace CircuitBreaker
             return resp;
         }
 
+        /// <summary>
+        /// Executes a specified Action within the confines of the Circuit Breaker Pattern (https://msdn.microsoft.com/en-us/library/dn589784.aspx)
+        /// </summary>
+        /// <param name="actionToInvoke"></param>
+        /// <returns>Circuit Breaker instance, allows client to determine situational handling (Closed/Half-Open/Open)</returns>
+        public CircuitBreaker ExecuteAction(Action actionToInvoke)
+        {
+            this.lastExecutionException = null;
+
+            #region Initiation Execution
+            lock (_circuitBreakerLock)
+            {
+                state.ExecutionStart();
+                if (state is OpenState)
+                {
+                    return this; // Stop execution of this method
+                }
+            }
+            #endregion
+
+            #region Do the work
+            try
+            {
+                actionToInvoke();
+            }
+            catch (Exception e)
+            {
+                lastExecutionException = e;
+                lock (_circuitBreakerLock)
+                {
+                    state.ExecutionFail(e);
+                }
+                return this; // Stop execution of this method
+            }
+            #endregion
+
+            #region Cleanup Execution
+            lock (_circuitBreakerLock)
+            {
+                state.ExecutionComplete();
+            }
+            #endregion
+
+            return this;
+        }
+
         #region State Management
+        public bool IsClosed
+        {
+            get { return state.Update() is ClosedState; }
+        }
+
+        public bool IsOpen
+        {
+            get { return state.Update() is OpenState; }
+        }
+
+        public bool IsHalfOpen
+        {
+            get { return state.Update() is HalfOpenState; }
+        }
+
         public bool IsThresholdReached()
         {
             return Failures >= Threshold;
