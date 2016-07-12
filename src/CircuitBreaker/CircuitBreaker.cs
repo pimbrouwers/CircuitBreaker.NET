@@ -2,6 +2,7 @@
 using Newtonsoft.Json.Converters;
 using System;
 using System.Collections.Generic;
+using System.Configuration;
 using System.Data;
 using System.IO;
 using System.Text.RegularExpressions;
@@ -12,6 +13,7 @@ namespace CircuitBreaker
 {
     public class CircuitBreaker
     {
+        private readonly string _workingDirectory;
         private readonly object _circuitBreakerLock = new object();
 
         private Cache _cache;
@@ -78,6 +80,8 @@ namespace CircuitBreaker
             {
                 FileName = GetFileNameFromCacheKey();
             }
+
+            _workingDirectory = ConfigurationManager.AppSettings["WorkingDirectory"] ?? "c:/temp";
 
             //Initialize
             MoveToClosedState();
@@ -427,19 +431,17 @@ namespace CircuitBreaker
 
         internal string ResolveFilePath()
         {
-            string wd = @"c:/Temp";
-
-            if (!Directory.Exists(wd))
-                Directory.CreateDirectory(wd);
+            if (!Directory.Exists(_workingDirectory))
+                Directory.CreateDirectory(_workingDirectory);
 
             string fileName = FileName;
             //check if there's a trailing slash, if not add
-            if (wd.Substring(wd.Length - 1) != "/")
+            if (_workingDirectory.Substring(_workingDirectory.Length - 1) != "/")
             {
                 fileName = String.Format("/{0}", fileName);
             }
 
-            return String.Format("{0}{1}", wd, fileName);
+            return String.Format("{0}{1}", _workingDirectory, fileName);
         }
         #endregion
     }
