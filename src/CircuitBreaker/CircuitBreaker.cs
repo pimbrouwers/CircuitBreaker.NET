@@ -1,6 +1,7 @@
 ﻿using Newtonsoft.Json;
 using Newtonsoft.Json.Converters;
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Configuration;
 using System.Data;
@@ -13,8 +14,18 @@ namespace CircuitBreaker
 {
     public class CircuitBreaker
     {
-        private readonly string _workingDirectory;
-        private readonly object _circuitBreakerLock = new object();
+        private static ConcurrentDictionary<string, object> CircuitBreakerLocks = new ConcurrentDictionary<string, object>();
+        private static ConcurrentDictionary<string, int> CircuitBreakerExceptionCounts = new ConcurrentDictionary<string, int>();
+
+        public string CircuitId { get; set; }
+
+        public object CircuitBreakLock
+        {
+            get
+            {
+                return CircuitBreakerLocks.GetOrAdd(CircuitId, new object());
+            }
+        }
 
         private Cache _cache;
         private Cache Cache
@@ -26,7 +37,7 @@ namespace CircuitBreaker
                     if (HttpContext.Current == null)
                         _cache = HttpRuntime.Cache;
                     else
-                        _cache = Cache;
+                        _cache = HttpContext.Current.Cache;
                 }
 
                 return _cache;
@@ -35,23 +46,43 @@ namespace CircuitBreaker
         private CircuitBreakerState state;
         private Exception lastExecutionException = null;
 
-        public int Failures { get; private set; }
+        public int Failures
+        {
+            get
+            {
+                return CircuitBreakerExceptionCounts.GetOrAdd(CircuitId, 0);
+            }
+            set
+            {
+                CircuitBreakerExceptionCounts.AddOrUpdate(CircuitId, value, (key, oldValue) => value);
+            }
+        }
         public int Threshold { get; private set; }
         public TimeSpan OpenTimeout { get; private set; }
 
         public string CacheKey { get; private set; }
         public CacheDependency CacheDependency { get; private set; }
         public TimeSpan CacheDuration { get; private set; }
+        public TimeSpan CacheSlidingExpiration { get; private set; }
+        public CacheItemPriority CacheItemPriority { get; private set; }
 
-        public bool FileBacked { get; private set; }
+        public bool FileBacked
+        {
+            get
+            {
+                return !string.IsNullOrWhiteSpace(WorkingDirectory);
+            }
+        }
         public string FileName { get; private set; }
         public string WorkingDirectory { get; private set; }
 
         public CircuitBreaker(
+            string circuitId,
             string cacheKey = null,
             CacheDependency cacheDependency = null,
             TimeSpan? cacheDuration = null,
-            bool fileBacked = false,
+            TimeSpan? cacheSlidingExpiration = null,
+            CacheItemPriority cacheItemPriority = CacheItemPriority.Normal,
             string workingDirectory = null,
             int failureThreshold = 3,
             TimeSpan? openTimeout = null
@@ -63,8 +94,13 @@ namespace CircuitBreaker
             if (cacheDuration == TimeSpan.Zero)
                 throw new ArgumentNullException("cacheDuration", "You must specify a cache duration greater than 0");
 
+            if (cacheSlidingExpiration == null)
+                cacheSlidingExpiration = Cache.NoSlidingExpiration;
+
             if (openTimeout == null)
                 openTimeout = TimeSpan.FromSeconds(5);
+
+            CircuitId = circuitId;
 
             Threshold = failureThreshold;
             OpenTimeout = (TimeSpan)openTimeout;
@@ -72,20 +108,20 @@ namespace CircuitBreaker
             CacheKey = cacheKey;
             CacheDependency = cacheDependency;
             CacheDuration = (TimeSpan)cacheDuration;
+            CacheSlidingExpiration = (TimeSpan)cacheSlidingExpiration;
+            CacheItemPriority = cacheItemPriority;
 
-            FileBacked = fileBacked;
-            WorkingDirectory = workingDirectory ?? @"c:/Temp";
+            WorkingDirectory = workingDirectory;
 
             if (FileBacked)
             {
                 FileName = GetFileNameFromCacheKey();
             }
 
-            _workingDirectory = ConfigurationManager.AppSettings["WorkingDirectory"] ?? "c:/temp";
-
             //Initialize
             MoveToClosedState();
         }
+
 
         /// <summary>
         /// Executes a specified Func<T> within the confines of the Circuit Breaker Pattern (https://msdn.microsoft.com/en-us/library/dn589784.aspx)
@@ -95,16 +131,18 @@ namespace CircuitBreaker
         /// <returns>Object of type T of default(T)</returns>
         public T Execute<T>(Func<T> funcToInvoke)
         {
+            object circuitBreakerLock = CircuitBreakLock;
+
             T resp = default(T);
             this.lastExecutionException = null;
 
             #region Initiation Execution
-            lock (_circuitBreakerLock)
+            lock (circuitBreakerLock)
             {
                 state.ExecutionStart();
                 if (state is OpenState)
                 {
-                    return resp; // Stop execution of this method
+                    return resp; //Stop execution of this method
                 }
             }
             #endregion
@@ -115,63 +153,44 @@ namespace CircuitBreaker
                 //Access Without Cache
                 if (String.IsNullOrWhiteSpace(FileName))
                 {
-                    //lock here, to protect volatile resource
-                    lock (_circuitBreakerLock)
+                    lock (circuitBreakerLock)
                     {
-                        resp = funcToInvoke(); ;
+                        //do the work
+                        resp = funcToInvoke();
                     }
                 }
                 else
                 {
                     //check mem cache
-                    resp = ReadFromCache<T>();
-
-                    //mem cache is empty
-                    if (resp == null)
+                    if (!ReadFromCache<T>(out resp))
                     {
-                        if (FileBacked)
+                        lock (circuitBreakerLock)
                         {
-                            //check file system
-                            resp = ReadFromFile<T>();
-
-                            //file system also empty
-                            if (resp == null)
+                            if (!ReadFromCache<T>(out resp))
                             {
-                                //check cache one more time
-                                resp = ReadFromCache<T>();
-
-                                if (resp == null)
+                                if (FileBacked)
                                 {
-                                    //lock here, to protect volatile resource
-                                    lock (_circuitBreakerLock)
+                                    //check file system
+                                    if (!ReadFromFile<T>(out resp))
                                     {
+                                        //do the work
                                         resp = funcToInvoke();
 
                                         AddToCache(resp);
                                         WriteToFile(resp);
                                     }
+                                    else
+                                    {
+                                        //read from file system is "fresh", pump into mem cache
+                                        AddToCache(resp);
+                                    }
                                 }
-                            }
-                            else
-                            {
-                                //read from file system is "fresh", pump into mem cache
-                                AddToCache(resp);
-                            }
-                        }
-                        else
-                        {
-                            //check cache one more time
-                            resp = ReadFromCache<T>();
-
-                            if (resp == null)
-                            {
-                                //lock here, to protect volatile resource
-                                lock (_circuitBreakerLock)
+                                else
                                 {
+                                    //do the work
                                     resp = funcToInvoke();
 
                                     AddToCache(resp);
-                                    WriteToFile(resp);
                                 }
                             }
                         }
@@ -180,69 +199,22 @@ namespace CircuitBreaker
             }
             catch (Exception e)
             {
-                lastExecutionException = e;
-                lock (_circuitBreakerLock)
+                lock (circuitBreakerLock)
                 {
+                    lastExecutionException = e;
                     state.ExecutionFail(e);
                 }
-                return resp; // Stop execution of this method
             }
-            #endregion
-
-            #region Cleanup Execution
-            lock (_circuitBreakerLock)
+            finally
             {
-                state.ExecutionComplete();
+                lock (circuitBreakerLock)
+                {
+                    state.ExecutionComplete();
+                }
             }
             #endregion
 
             return resp;
-        }
-
-        /// <summary>
-        /// Executes a specified Action within the confines of the Circuit Breaker Pattern (https://msdn.microsoft.com/en-us/library/dn589784.aspx)
-        /// </summary>
-        /// <param name="actionToInvoke"></param>
-        /// <returns>Circuit Breaker instance, allows client to determine situational handling (Closed/Half-Open/Open)</returns>
-        public CircuitBreaker ExecuteAction(Action actionToInvoke)
-        {
-            this.lastExecutionException = null;
-
-            #region Initiation Execution
-            lock (_circuitBreakerLock)
-            {
-                state.ExecutionStart();
-                if (state is OpenState)
-                {
-                    return this; // Stop execution of this method
-                }
-            }
-            #endregion
-
-            #region Do the work
-            try
-            {
-                actionToInvoke();
-            }
-            catch (Exception e)
-            {
-                lastExecutionException = e;
-                lock (_circuitBreakerLock)
-                {
-                    state.ExecutionFail(e);
-                }
-                return this; // Stop execution of this method
-            }
-            #endregion
-
-            #region Cleanup Execution
-            lock (_circuitBreakerLock)
-            {
-                state.ExecutionComplete();
-            }
-            #endregion
-
-            return this;
         }
 
         #region State Management
@@ -271,20 +243,14 @@ namespace CircuitBreaker
             return lastExecutionException;
         }
 
-        public void Close()
+        void Close()
         {
-            lock (_circuitBreakerLock)
-            {
-                MoveToClosedState();
-            }
+            MoveToClosedState();
         }
 
-        public void Open()
+        void Open()
         {
-            lock (_circuitBreakerLock)
-            {
-                MoveToOpenState();
-            }
+            MoveToOpenState();
         }
 
         internal CircuitBreakerState MoveToClosedState()
@@ -317,30 +283,34 @@ namespace CircuitBreaker
         #endregion
 
         #region Caching
-        internal T ReadFromCache<T>()
+        internal bool ReadFromCache<T>(out T resp)
         {
+            bool success = true;
             var res = Cache[CacheKey];
+
             if (res is T)
-                return (T)res;
+                resp = (T)res;
             else
-                return default(T);
+            {
+                success = false;
+                resp = default(T);
+            }
+
+            return success;
         }
 
         internal void AddToCache<T>(T obj)
         {
-            T inCache = ReadFromCache<T>();
-
-            if (inCache != null)
-                Cache.Remove(CacheKey);
-
-            Cache.Add(CacheKey, obj, CacheDependency, DateTime.Now.Add(CacheDuration), Cache.NoSlidingExpiration, CacheItemPriority.NotRemovable, null);
+            Cache.Remove(CacheKey);
+            Cache.Add(CacheKey, obj, CacheDependency, DateTime.Now.Add(CacheDuration), CacheSlidingExpiration, CacheItemPriority, null);
         }
         #endregion
 
         #region File Management
-        internal T ReadFromFile<T>()
+        internal bool ReadFromFile<T>(out T resp)
         {
-            T resp = default(T);
+            bool success = false;
+            resp = default(T);
             string path = ResolveFilePath();
 
             if (!string.IsNullOrWhiteSpace(path))
@@ -349,31 +319,24 @@ namespace CircuitBreaker
 
                 if (fi.Exists)
                 {
-                    lock (_circuitBreakerLock)
+
+                    //if this file is "too old" delete
+                    if (DateTime.UtcNow - fi.LastWriteTimeUtc > CacheDuration)
                     {
-                        //if this file is "too old" delete
-                        if (DateTime.UtcNow - fi.LastWriteTimeUtc > CacheDuration)
-                        {
-                            fi.Delete();
-                        }
-                        //file is still fresh enough, read and pump into mem cahce
-                        else
-                        {
-                            string res = File.ReadAllText(path);
-
-                            resp = JsonConvert.DeserializeObject<T>(res);
-
-                            if (resp is T)
-                            {
-                                //check if the objet is in mem cache, if not add it
-                                AddToCache(resp);
-                            }
-                        }
+                        fi.Delete();
                     }
+                    //file is still fresh enough, read and pump into mem cahce
+                    else
+                    {
+                        string res = File.ReadAllText(path);
+                        resp = JsonConvert.DeserializeObject<T>(res);
+                        success = true;
+                    }
+
                 }
             }
 
-            return resp;
+            return success;
         }
 
         internal void WriteToFile<T>(T objToWrite)
@@ -388,17 +351,15 @@ namespace CircuitBreaker
             {
                 FileInfo fi = new FileInfo(path);
 
-                lock (_circuitBreakerLock)
-                {
-                    if (fi.Exists)
-                        fi.Delete();
+                if (fi.Exists)
+                    fi.Delete();
 
-                    File.WriteAllText(path, objStr);
+                File.WriteAllText(path, objStr);
 
-                    //write to object cache
-                    AddToCache(objToWrite);
-                }
+                //write to object cache
+                AddToCache(objToWrite);
             }
+
         }
 
         internal string SerializeObject<T>(T objToSerialize)
@@ -431,17 +392,17 @@ namespace CircuitBreaker
 
         internal string ResolveFilePath()
         {
-            if (!Directory.Exists(_workingDirectory))
-                Directory.CreateDirectory(_workingDirectory);
+            if (!Directory.Exists(WorkingDirectory))
+                Directory.CreateDirectory(WorkingDirectory);
 
             string fileName = FileName;
             //check if there's a trailing slash, if not add
-            if (_workingDirectory.Substring(_workingDirectory.Length - 1) != "/")
+            if (WorkingDirectory.Substring(WorkingDirectory.Length - 1) != "/")
             {
                 fileName = String.Format("/{0}", fileName);
             }
 
-            return String.Format("{0}{1}", _workingDirectory, fileName);
+            return String.Format("{0}{1}", WorkingDirectory, fileName);
         }
         #endregion
     }
