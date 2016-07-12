@@ -1,0 +1,6 @@
+{
+  "name": "CircuitBreaker.NET",
+  "tagline": "Implementation of Circuit Breaker Pattern for .NET with Memory & File System Caching - Access volatile resources in a thread safe manner.",
+  "body": "# CircuitBreaker.NET\r\nImplementation of Circuit Breaker Pattern for .NET with Memory &amp; File System Caching - Access volatile resources in a thread safe manner.\r\n\r\n## Usage\r\n```c#\r\nCircuitBreaker breaker = new CircuitBreaker(\"CircuitKey\", \"CacheKey\");\r\n\r\nvar myResults = breaker.Execute(() =>\r\n{\r\n    return \"hello world!\";\r\n});\r\n```\r\n\r\n## Constructor Options\r\n```c#\r\nstring circuitId,\r\nstring cacheKey = null,\r\nCacheDependency cacheDependency = null,\r\nTimeSpan? cacheDuration = null,\r\nTimeSpan? cacheSlidingExpiration = null,\r\nCacheItemPriority cacheItemPriority = CacheItemPriority.Normal,\r\nstring workingDirectory = null,\r\nint failureThreshold = 3,\r\nTimeSpan? openTimeout = null\r\n```",
+  "note": "Don't delete this file! It's used internally to help with page regeneration."
+}
