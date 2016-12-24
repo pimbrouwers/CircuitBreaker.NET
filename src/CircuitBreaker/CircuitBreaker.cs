@@ -7,6 +7,7 @@ using System.Configuration;
 using System.Data;
 using System.IO;
 using System.Text.RegularExpressions;
+using System.Threading.Tasks;
 using System.Web;
 using System.Web.Caching;
 
@@ -204,6 +205,8 @@ namespace CircuitBreaker
                     lastExecutionException = e;
                     state.ExecutionFail(e);
                 }
+
+                throw;
             }
             finally
             {
@@ -211,6 +214,85 @@ namespace CircuitBreaker
                 {
                     state.ExecutionComplete();
                 }
+            }
+            #endregion
+
+            return resp;
+        }
+
+        /// <summary>
+        /// Executes a specified Func<T> within the confines of the Circuit Breaker Pattern (https://msdn.microsoft.com/en-us/library/dn589784.aspx)
+        /// </summary>
+        /// <typeparam name="T"></typeparam>
+        /// <param name="funcToIvoke"></param>
+        /// <returns>Object of type T of default(T)</returns>
+        public async Task<T> ExecuteAsync<T>(Func<Task<T>> funcToInvoke)
+        {
+            T resp = default(T);
+            this.lastExecutionException = null;
+
+            #region Initiation Execution
+            state.ExecutionStart();
+            if (state is OpenState)
+            {
+                return resp; //Stop execution of this method
+            }
+            #endregion
+
+            #region Do the work
+            try
+            {
+                //Access Without Cache
+                if (String.IsNullOrWhiteSpace(FileName))
+                {
+                    //do the work
+                    resp = await funcToInvoke();
+                }
+                else
+                {
+                    //check mem cache
+                    if (!ReadFromCache<T>(out resp))
+                    {
+                        if (!ReadFromCache<T>(out resp))
+                        {
+                            if (FileBacked)
+                            {
+                                //check file system
+                                if (!ReadFromFile<T>(out resp))
+                                {
+                                    //do the work
+                                    resp = await funcToInvoke();
+
+                                    AddToCache(resp);
+                                    WriteToFile(resp);
+                                }
+                                else
+                                {
+                                    //read from file system is "fresh", pump into mem cache
+                                    AddToCache(resp);
+                                }
+                            }
+                            else
+                            {
+                                //do the work
+                                resp = await funcToInvoke();
+
+                                AddToCache(resp);
+                            }
+                        }
+                    }
+                }
+            }
+            catch (Exception e)
+            {
+                lastExecutionException = e;
+                state.ExecutionFail(e);
+
+                throw;
+            }
+            finally
+            {
+                state.ExecutionComplete();
             }
             #endregion
 
@@ -301,8 +383,11 @@ namespace CircuitBreaker
 
         internal void AddToCache<T>(T obj)
         {
-            Cache.Remove(CacheKey);
-            Cache.Add(CacheKey, obj, CacheDependency, DateTime.Now.Add(CacheDuration), CacheSlidingExpiration, CacheItemPriority, null);
+            if (obj != null)
+            {
+                Cache.Remove(CacheKey);
+                Cache.Add(CacheKey, obj, CacheDependency, DateTime.Now.Add(CacheDuration), CacheSlidingExpiration, CacheItemPriority, null);
+            }
         }
         #endregion
 
@@ -342,6 +427,9 @@ namespace CircuitBreaker
         internal void WriteToFile<T>(T objToWrite)
         {
             if (!FileBacked)
+                return;
+
+            if (objToWrite == null)
                 return;
 
             string objStr = JsonConvert.SerializeObject(objToWrite);
